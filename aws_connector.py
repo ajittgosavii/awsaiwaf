@@ -59,13 +59,17 @@ def get_aws_credentials_from_secrets() -> Tuple[Optional[AWSCredentials], str]:
                     aws_secrets.get('access_key_id') or 
                     aws_secrets.get('ACCESS_KEY_ID') or
                     aws_secrets.get('aws_access_key_id') or
-                    aws_secrets.get('AWS_ACCESS_KEY_ID')
+                    aws_secrets.get('AWS_ACCESS_KEY_ID') or
+                    aws_secrets.get('management_access_key_id') or
+                    aws_secrets.get('MANAGEMENT_ACCESS_KEY_ID')
                 )
                 secret_key = (
                     aws_secrets.get('secret_access_key') or 
                     aws_secrets.get('SECRET_ACCESS_KEY') or
                     aws_secrets.get('aws_secret_access_key') or
-                    aws_secrets.get('AWS_SECRET_ACCESS_KEY')
+                    aws_secrets.get('AWS_SECRET_ACCESS_KEY') or
+                    aws_secrets.get('management_secret_access_key') or
+                    aws_secrets.get('MANAGEMENT_SECRET_ACCESS_KEY')
                 )
                 region = (
                     aws_secrets.get('default_region') or 
