@@ -74,6 +74,8 @@ except Exception as e:
     MODULE_STATUS['EKS Modernization'] = False
     MODULE_ERRORS['EKS Modernization'] = str(e)
 
+
+try:
 try:
     from compliance_module import ComplianceModule
     MODULE_STATUS['Compliance'] = True
@@ -81,6 +83,7 @@ except Exception as e:
     MODULE_STATUS['Compliance'] = False
     MODULE_ERRORS['Compliance'] = str(e)
 
+try:
 try:
     from multi_account_scanner import MultiAccountScanner
     MODULE_STATUS['Multi-Account Scanner'] = True
@@ -229,16 +232,14 @@ def render_aws_connector_tab():
 def render_main_content():
     """Render main content area with tabs"""
     
-    # Create tabs - WAF FOCUSED (8 modules)
+    # Create tabs
     tabs = st.tabs([
         "🎨 Architecture Designer",
         "⚡ WAF Assessment",
         "🔍 AWS Scanner",
         "🚀 EKS Modernization",
-        "📋 Design Planning",
-        "🔒 Compliance",
-        "☁️ Multi-Account Scanner",
-        "🔧 AWS Connector"
+        "📊 Resource Inventory",
+        "☁️ AWS Connector"
     ])
     
     # Tab 1: Architecture Designer
@@ -318,38 +319,38 @@ def render_main_content():
             st.warning("EKS Modernization module not available")
             st.info("Install eks_modernization_module.py to enable this feature")
     
-    # Tab 5: Design Planning
+    # Tab 5: FinOps
     with tabs[4]:
-        if MODULE_STATUS.get('Design Planning'):
+        if MODULE_STATUS.get('FinOps'):
             try:
-                DesignPlanningModule.render()
             except Exception as e:
-                st.error(f"Error loading Design Planning: {str(e)}")
+                st.error(f"Error loading FinOps: {str(e)}")
         else:
-            st.warning("Design Planning module not available")
-            st.info("Install modules_design_planning.py to enable this feature")
+            st.warning("FinOps module not available")
+            st.info("Install finops_module.py to enable this feature")
     
-    # Tab 6: Compliance
+    # Tab 6: Security & Compliance
     with tabs[5]:
-        if MODULE_STATUS.get('Compliance'):
+        if MODULE_STATUS.get('Security & Compliance'):
+            try:
+            except Exception as e:
+                st.error(f"Error loading Security: {str(e)}")
+        elif MODULE_STATUS.get('Compliance'):
             try:
                 ComplianceModule.render()
             except Exception as e:
                 st.error(f"Error loading Compliance: {str(e)}")
         else:
-            st.warning("Compliance module not available")
-            st.info("Install compliance_module.py to enable this feature")
+            st.warning("Security & Compliance modules not available")
     
-    # Tab 7: Multi-Account Scanner
+    # Tab 7: Resource Inventory
     with tabs[6]:
-        if MODULE_STATUS.get('Multi-Account Scanner'):
+        if MODULE_STATUS.get('Resource Inventory'):
             try:
-                MultiAccountScanner.render()
             except Exception as e:
-                st.error(f"Error loading Multi-Account Scanner: {str(e)}")
+                st.error(f"Error loading Resource Inventory: {str(e)}")
         else:
-            st.warning("Multi-Account Scanner module not available")
-            st.info("Install multi_account_scanner.py to enable this feature")
+            st.warning("Resource Inventory module not available")
     
     # Tab 8: AWS Connector
     with tabs[7]:
