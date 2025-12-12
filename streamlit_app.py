@@ -209,7 +209,7 @@ def render_single_account_connector():
     
     st.markdown("### 🔐 Single Account Configuration")
     
-    tab1, tab2, tab3 = st.tabs(["Manual Credentials", "Secrets File", "IAM Role"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Manual Credentials", "🔒 AssumeRole", "Secrets File", "IAM Role"])
     
     with tab1:
         st.markdown("#### Enter AWS Credentials Manually")
@@ -287,9 +287,220 @@ def render_single_account_connector():
                     del st.session_state.aws_secret_key
                 st.rerun()
     
+    # TAB 2: AssumeRole (NEW!)
     with tab2:
+        st.markdown("#### 🔒 AssumeRole Configuration")
+        
+        st.info("""
+        **Enterprise Security Best Practice**
+        
+        AssumeRole provides temporary credentials instead of long-term access keys:
+        - ✅ More secure (temporary credentials expire)
+        - ✅ Better audit trail
+        - ✅ Fine-grained permissions
+        - ✅ No long-term credential storage
+        - ✅ Recommended for production environments
+        """)
+        
+        st.markdown("---")
+        st.markdown("**Step 1: Base Credentials**")
+        st.markdown("Provide credentials that have permission to assume the target role:")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            base_access_key = st.text_input(
+                "Base Access Key ID",
+                type="password",
+                help="Credentials with sts:AssumeRole permission",
+                key="assume_base_ak"
+            )
+            base_region = st.selectbox(
+                "Region",
+                ["us-east-1", "us-east-2", "us-west-1", "us-west-2", 
+                 "eu-west-1", "eu-central-1", "ap-southeast-1", "ap-northeast-1"],
+                key="assume_base_region"
+            )
+        
+        with col2:
+            base_secret_key = st.text_input(
+                "Base Secret Access Key",
+                type="password",
+                key="assume_base_sk"
+            )
+        
+        st.markdown("---")
+        st.markdown("**Step 2: Target Role**")
+        st.markdown("Specify the role to assume:")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            role_arn = st.text_input(
+                "Role ARN",
+                placeholder="arn:aws:iam::123456789012:role/WAFAdvisorRole",
+                help="ARN of the role to assume",
+                key="assume_role_arn"
+            )
+        
+        with col2:
+            external_id = st.text_input(
+                "External ID (Optional)",
+                placeholder="Enter if required by the role",
+                help="External ID for added security (recommended for cross-account)",
+                key="assume_external_id"
+            )
+        
+        st.markdown("---")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🔐 Assume Role & Connect", type="primary", use_container_width=True, key="assume_connect"):
+                if not (base_access_key and base_secret_key and role_arn):
+                    st.error("❌ Provide base credentials and role ARN")
+                else:
+                    with st.spinner("Assuming role..."):
+                        try:
+                            import boto3
+                            from aws_connector import assume_role
+                            
+                            # Create base session
+                            base_session = boto3.Session(
+                                aws_access_key_id=base_access_key,
+                                aws_secret_access_key=base_secret_key,
+                                region_name=base_region
+                            )
+                            
+                            # Assume the role
+                            assumed_creds = assume_role(
+                                base_session,
+                                role_arn,
+                                external_id if external_id else None,
+                                session_name="WAFAdvisorSession"
+                            )
+                            
+                            if assumed_creds:
+                                # Save to session state
+                                st.session_state.assumed_role_credentials = assumed_creds
+                                st.session_state.aws_role_arn = role_arn
+                                st.session_state.aws_external_id = external_id
+                                
+                                st.success("✅ Role assumed successfully!")
+                                st.info(f"**Assumed Role:** {role_arn}")
+                                st.info(f"**Expires:** {assumed_creds.expiration}")
+                                st.rerun()
+                            else:
+                                st.error("❌ Failed to assume role")
+                                
+                        except Exception as e:
+                            st.error(f"❌ Error: {str(e)}")
+        
+        with col2:
+            if st.button("🔍 Test AssumeRole", use_container_width=True, key="assume_test"):
+                if not (base_access_key and base_secret_key and role_arn):
+                    st.warning("Fill in all required fields first")
+                else:
+                    with st.spinner("Testing role assumption..."):
+                        try:
+                            import boto3
+                            
+                            base_session = boto3.Session(
+                                aws_access_key_id=base_access_key,
+                                aws_secret_access_key=base_secret_key,
+                                region_name=base_region
+                            )
+                            
+                            sts = base_session.client('sts')
+                            
+                            # Test assume role
+                            assume_params = {
+                                'RoleArn': role_arn,
+                                'RoleSessionName': 'WAFAdvisorTest',
+                                'DurationSeconds': 900  # 15 minutes for test
+                            }
+                            if external_id:
+                                assume_params['ExternalId'] = external_id
+                            
+                            response = sts.assume_role(**assume_params)
+                            
+                            st.success("✅ AssumeRole test successful!")
+                            st.json({
+                                "Assumed Role ARN": response['AssumedRoleUser']['Arn'],
+                                "Account": response['AssumedRoleUser']['Arn'].split(':')[4],
+                                "Expiration": response['Credentials']['Expiration'].isoformat()
+                            })
+                            
+                        except Exception as e:
+                            st.error(f"❌ AssumeRole test failed: {str(e)}")
+                            
+                            if "AccessDenied" in str(e):
+                                st.warning("""
+                                **Common causes:**
+                                - Base credentials don't have sts:AssumeRole permission
+                                - Role trust policy doesn't allow your account/user
+                                - External ID mismatch
+                                - Role doesn't exist or incorrect ARN
+                                """)
+        
+        # Show IAM policy helper
+        with st.expander("📋 Required IAM Permissions"):
+            st.markdown("**Base credentials need this policy:**")
+            st.code(f"""{{
+  "Version": "2012-10-17",
+  "Statement": [
+    {{
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "{role_arn if role_arn else 'arn:aws:iam::ACCOUNT-ID:role/ROLE-NAME'}"
+    }}
+  ]
+}}""", language="json")
+            
+            st.markdown("**Target role needs this trust policy:**")
+            st.code("""{{
+  "Version": "2012-10-17",
+  "Statement": [
+    {{
+      "Effect": "Allow",
+      "Principal": {{
+        "AWS": "arn:aws:iam::BASE-ACCOUNT-ID:user/USERNAME"
+      }},
+      "Action": "sts:AssumeRole",
+      "Condition": {{
+        "StringEquals": {{
+          "sts:ExternalId": "YOUR-EXTERNAL-ID"
+        }}
+      }}
+    }}
+  ]
+}}""", language="json")
+            
+            st.markdown("**Target role needs these permissions:**")
+            st.code("""{{
+  "Version": "2012-10-17",
+  "Statement": [
+    {{
+      "Effect": "Allow",
+      "Action": [
+        "ec2:Describe*",
+        "rds:Describe*",
+        "s3:GetBucketLocation",
+        "s3:ListBucket",
+        "iam:GetAccountSummary",
+        "cloudwatch:DescribeAlarms",
+        "lambda:List*",
+        "dynamodb:Describe*"
+      ],
+      "Resource": "*"
+    }}
+  ]
+}}""", language="json")
+    
+    with tab3:
         st.markdown("#### Use Streamlit Secrets")
         
+        st.markdown("**Format 1: Direct Credentials**")
         st.code("""
 # .streamlit/secrets.toml
 ANTHROPIC_API_KEY = "sk-ant-..."
@@ -298,6 +509,22 @@ ANTHROPIC_API_KEY = "sk-ant-..."
 access_key_id = "AKIA..."
 secret_access_key = "..."
 default_region = "us-east-1"
+        """, language="toml")
+        
+        st.markdown("**Format 2: With AssumeRole**")
+        st.code("""
+# .streamlit/secrets.toml
+ANTHROPIC_API_KEY = "sk-ant-..."
+
+[aws]
+# Base credentials
+access_key_id = "AKIA..."
+secret_access_key = "..."
+default_region = "us-east-1"
+
+# Role to assume
+role_arn = "arn:aws:iam::123456789012:role/WAFAdvisorRole"
+external_id = "your-secure-external-id"  # Optional but recommended
         """, language="toml")
         
         if st.button("🔄 Reload from Secrets"):
@@ -311,7 +538,7 @@ default_region = "us-east-1"
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
     
-    with tab3:
+    with tab4:
         st.markdown("#### Use IAM Role (for EC2/ECS/Lambda)")
         
         st.info("""
@@ -343,11 +570,15 @@ def render_multi_account_connector():
     st.markdown("### 🏢 Multi-Account Configuration")
     
     st.info("""
-    Connect multiple AWS accounts for organization-wide Well-Architected Framework scanning.
-    You can add accounts manually or import from AWS Organizations.
+    **🔒 Enterprise Multi-Account Access**
+    
+    Three ways to configure multi-account access:
+    1. **Manual with Credentials** - Add accounts individually with access keys
+    2. **AssumeRole (Recommended)** - Use hub credentials to assume roles in target accounts
+    3. **AWS Organizations** - Auto-discover and configure organization accounts
     """)
     
-    tab1, tab2 = st.tabs(["Add Accounts Manually", "Import from AWS Organizations"])
+    tab1, tab2, tab3 = st.tabs(["Add Accounts Manually", "🔒 AssumeRole Setup", "Import from AWS Organizations"])
     
     with tab1:
         st.markdown("#### Add Account")
@@ -402,7 +633,205 @@ def render_multi_account_connector():
         else:
             st.info("No accounts connected yet")
     
+    # TAB 2: AssumeRole Setup (NEW!)
     with tab2:
+        st.markdown("#### 🔒 Multi-Account AssumeRole Configuration")
+        
+        st.success("""
+        **Enterprise Best Practice for Multi-Account Access**
+        
+        Benefits:
+        - ✅ One set of hub credentials for all accounts
+        - ✅ Temporary credentials for each target account
+        - ✅ No credentials stored in target accounts
+        - ✅ Easy to add/remove accounts
+        - ✅ Scales to 100+ accounts
+        """)
+        
+        st.markdown("---")
+        st.markdown("**Step 1: Configure Hub Account Credentials**")
+        st.markdown("These credentials will be used to assume roles in target accounts:")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            hub_access_key = st.text_input(
+                "Hub Account Access Key",
+                type="password",
+                help="Base credentials with sts:AssumeRole permission",
+                key="multi_hub_ak"
+            )
+        
+        with col2:
+            hub_secret_key = st.text_input(
+                "Hub Account Secret Key",
+                type="password",
+                key="multi_hub_sk"
+            )
+        
+        if st.button("💾 Save Hub Credentials", key="multi_save_hub"):
+            if hub_access_key and hub_secret_key:
+                st.session_state.multi_hub_access_key = hub_access_key
+                st.session_state.multi_hub_secret_key = hub_secret_key
+                st.success("✅ Hub credentials saved!")
+            else:
+                st.error("❌ Provide both keys")
+        
+        st.markdown("---")
+        st.markdown("**Step 2: Add Target Accounts with AssumeRole**")
+        st.markdown("Each target account should have the same role name with trust policy allowing hub account:")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            acc_name = st.text_input("Account Name", placeholder="Production", key="multi_assume_name")
+        
+        with col2:
+            acc_id = st.text_input("Account ID", placeholder="123456789012", key="multi_assume_id")
+        
+        with col3:
+            role_name = st.text_input("Role Name", value="WAFAdvisorRole", key="multi_assume_role")
+        
+        with col4:
+            ext_id = st.text_input("External ID", placeholder="Optional", key="multi_assume_extid")
+        
+        if st.button("➕ Add Account with AssumeRole", type="primary", key="multi_add_assume_account"):
+            if acc_name and acc_id and role_name:
+                # Construct role ARN
+                role_arn = f"arn:aws:iam::{acc_id}:role/{role_name}"
+                
+                account = {
+                    'name': acc_name,
+                    'account_id': acc_id,
+                    'role_arn': role_arn,
+                    'external_id': ext_id if ext_id else None,
+                    'auth_method': 'assume_role',
+                    'region': 'us-east-1'  # Default, can be changed
+                }
+                
+                if 'connected_accounts' not in st.session_state:
+                    st.session_state.connected_accounts = []
+                
+                st.session_state.connected_accounts.append(account)
+                st.success(f"✅ Added {acc_name} with AssumeRole")
+                st.info(f"💡 Role ARN: {role_arn}")
+                st.rerun()
+            else:
+                st.error("❌ Fill in Account Name, ID, and Role Name")
+        
+        st.markdown("---")
+        st.markdown("#### Connected Accounts (AssumeRole)")
+        
+        assume_role_accounts = [acc for acc in st.session_state.get('connected_accounts', []) 
+                               if acc.get('auth_method') == 'assume_role']
+        
+        if assume_role_accounts:
+            for idx, account in enumerate(assume_role_accounts):
+                with st.expander(f"📌 {account['name']} - {account.get('account_id', 'N/A')}"):
+                    col1, col2 = st.columns([3, 1])
+                    
+                    with col1:
+                        st.markdown(f"**Account ID:** {account.get('account_id', 'N/A')}")
+                        st.markdown(f"**Role ARN:** {account.get('role_arn', 'N/A')}")
+                        st.markdown(f"**External ID:** {account.get('external_id', 'Not set')}")
+                        st.markdown(f"**Auth Method:** AssumeRole")
+                    
+                    with col2:
+                        if st.button("🗑️ Remove", key=f"multi_assume_del_{idx}"):
+                            # Find this account in the full list
+                            all_accounts = st.session_state.connected_accounts
+                            for i, acc in enumerate(all_accounts):
+                                if (acc.get('account_id') == account.get('account_id') and 
+                                    acc.get('auth_method') == 'assume_role'):
+                                    all_accounts.pop(i)
+                                    break
+                            st.rerun()
+                        
+                        if st.button("🔍 Test", key=f"multi_assume_test_{idx}"):
+                            # Test role assumption
+                            with st.spinner(f"Testing {account['name']}..."):
+                                try:
+                                    import boto3
+                                    from aws_connector import assume_role
+                                    
+                                    if ('multi_hub_access_key' not in st.session_state or 
+                                        'multi_hub_secret_key' not in st.session_state):
+                                        st.error("❌ Configure hub credentials first (Step 1)")
+                                    else:
+                                        base_session = boto3.Session(
+                                            aws_access_key_id=st.session_state.multi_hub_access_key,
+                                            aws_secret_access_key=st.session_state.multi_hub_secret_key
+                                        )
+                                        
+                                        assumed_creds = assume_role(
+                                            base_session,
+                                            account['role_arn'],
+                                            account.get('external_id'),
+                                            session_name="WAFAdvisorTest"
+                                        )
+                                        
+                                        if assumed_creds:
+                                            st.success(f"✅ {account['name']} connection successful!")
+                                            st.info(f"Account: {assumed_creds.assumed_role_arn.split(':')[4]}")
+                                            st.info(f"Expires: {assumed_creds.expiration}")
+                                        else:
+                                            st.error(f"❌ Failed to assume role in {account['name']}")
+                                            
+                                except Exception as e:
+                                    st.error(f"❌ Error: {str(e)}")
+        else:
+            st.info("No AssumeRole accounts added yet. Add accounts above.")
+        
+        # Show setup guide
+        with st.expander("📋 Setup Guide for AssumeRole"):
+            st.markdown("""
+            **How to Set Up AssumeRole for Multi-Account:**
+            
+            1. **Hub Account Setup:**
+               - Create IAM user with `sts:AssumeRole` permission
+               - Policy should allow assuming role in target accounts
+               
+            2. **Each Target Account:**
+               - Create role named `WAFAdvisorRole` (or custom name)
+               - Add trust policy allowing hub account to assume
+               - Attach ReadOnlyAccess or custom permissions
+               - Optional: Require External ID for security
+            
+            3. **In This Tool:**
+               - Enter hub account credentials (Step 1)
+               - Add each target account (Step 2)
+               - Provide Account ID, Role Name, External ID
+               - Test each account connection
+            
+            **Example Trust Policy for Target Account Role:**
+            ```json
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Principal": {
+                    "AWS": "arn:aws:iam::HUB-ACCOUNT-ID:user/hub-user"
+                  },
+                  "Action": "sts:AssumeRole",
+                  "Condition": {
+                    "StringEquals": {
+                      "sts:ExternalId": "your-external-id"
+                    }
+                  }
+                }
+              ]
+            }
+            ```
+            
+            **Benefits:**
+            - Hub credentials never stored in target accounts
+            - Temporary credentials (expire automatically)
+            - Easy to scale to 100+ accounts
+            - Centralized access management
+            """)
+    
+    with tab3:
         st.markdown("#### Import from AWS Organizations")
         
         st.warning("⚠️ Requires AWS Organizations permissions")
