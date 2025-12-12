@@ -103,12 +103,58 @@ def get_aws_credentials_from_secrets() -> Tuple[Optional[AWSCredentials], str]:
     
     return None, "\n".join(debug_info) if debug_info else "No secrets"
 
-def get_aws_session(credentials: AWSCredentials):
-    """Create boto3 session from credentials"""
+def get_aws_session(credentials: Optional[AWSCredentials] = None):
+    """
+    Create boto3 session from credentials.
+    If credentials not provided, tries to get from multiple sources.
+    """
     try:
         import boto3
         from botocore.config import Config
         
+        # If no credentials provided, try to get them
+        if credentials is None:
+            # Priority order:
+            # 1. Session state (from manual entry)
+            # 2. Streamlit secrets
+            # 3. Environment variables
+            # 4. AWS CLI config
+            # 5. IAM role (for EC2/ECS/Lambda)
+            
+            # Try session state first
+            if ('aws_access_key' in st.session_state and 
+                'aws_secret_key' in st.session_state):
+                session = boto3.Session(
+                    aws_access_key_id=st.session_state.aws_access_key,
+                    aws_secret_access_key=st.session_state.aws_secret_key,
+                    region_name=st.session_state.get('aws_region', 'us-east-1')
+                )
+                return session
+            
+            # Try Streamlit secrets
+            creds, debug = get_aws_credentials_from_secrets()
+            if creds:
+                session = boto3.Session(
+                    aws_access_key_id=creds.access_key_id,
+                    aws_secret_access_key=creds.secret_access_key,
+                    aws_session_token=creds.session_token,
+                    region_name=creds.region
+                )
+                return session
+            
+            # Try default boto3 credential chain (env vars, CLI, IAM role)
+            try:
+                session = boto3.Session()
+                # Test if credentials are available
+                sts = session.client('sts')
+                sts.get_caller_identity()
+                return session
+            except:
+                pass
+            
+            return None
+        
+        # Credentials provided, use them
         session = boto3.Session(
             aws_access_key_id=credentials.access_key_id,
             aws_secret_access_key=credentials.secret_access_key,
@@ -116,8 +162,9 @@ def get_aws_session(credentials: AWSCredentials):
             region_name=credentials.region
         )
         return session
+        
     except Exception as e:
-        st.error(f"Failed to create session: {e}")
+        logger.error(f"Failed to create session: {e}")
         return None
 
 def test_aws_connection(session) -> Tuple[bool, str, Dict]:
