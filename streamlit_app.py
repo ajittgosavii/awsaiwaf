@@ -289,21 +289,7 @@ def render_single_account_connector():
     
     # TAB 2: AssumeRole (NEW!)
     with tab2:
-        st.markdown("#### 🔒 AssumeRole Configuration")
-        
-        st.info("""
-        **Enterprise Security Best Practice**
-        
-        AssumeRole provides temporary credentials instead of long-term access keys:
-        - ✅ More secure (temporary credentials expire)
-        - ✅ Better audit trail
-        - ✅ Fine-grained permissions
-        - ✅ No long-term credential storage
-        - ✅ Recommended for production environments
-        """)
-        
-        st.markdown("---")
-        st.markdown("**Step 1: Base Credentials**")
+        st.markdown("#### Step 1: Base Credentials")
         st.markdown("Provide credentials that have permission to assume the target role:")
         
         col1, col2 = st.columns(2)
@@ -312,25 +298,28 @@ def render_single_account_connector():
             base_access_key = st.text_input(
                 "Base Access Key ID",
                 type="password",
-                help="Credentials with sts:AssumeRole permission",
+                help="IAM user credentials with sts:AssumeRole permission",
                 key="assume_base_ak"
-            )
-            base_region = st.selectbox(
-                "Region",
-                ["us-east-1", "us-east-2", "us-west-1", "us-west-2", 
-                 "eu-west-1", "eu-central-1", "ap-southeast-1", "ap-northeast-1"],
-                key="assume_base_region"
             )
         
         with col2:
             base_secret_key = st.text_input(
                 "Base Secret Access Key",
                 type="password",
+                help="Secret key for base credentials",
                 key="assume_base_sk"
             )
         
+        base_region = st.selectbox(
+            "Region",
+            ["us-east-1", "us-east-2", "us-west-1", "us-west-2", 
+             "eu-west-1", "eu-central-1", "ap-southeast-1", "ap-northeast-1"],
+            index=0,
+            key="assume_base_region"
+        )
+        
         st.markdown("---")
-        st.markdown("**Step 2: Target Role**")
+        st.markdown("#### Step 2: Target Role")
         st.markdown("Specify the role to assume:")
         
         col1, col2 = st.columns(2)
@@ -338,8 +327,8 @@ def render_single_account_connector():
         with col1:
             role_arn = st.text_input(
                 "Role ARN",
-                placeholder="arn:aws:iam::123456789012:role/WAFAdvisorRole",
-                help="ARN of the role to assume",
+                value="arn:aws:iam::950766978386:role/WAFAdvisorCrossAccountRole",
+                help="ARN of the role to assume in the target account",
                 key="assume_role_arn"
             )
         
@@ -347,9 +336,22 @@ def render_single_account_connector():
             external_id = st.text_input(
                 "External ID (Optional)",
                 placeholder="Enter if required by the role",
-                help="External ID for added security (recommended for cross-account)",
+                help="External ID for cross-account security",
                 key="assume_external_id"
             )
+        
+        # Info section
+        st.info("""
+        **Your Role Configuration:**
+        - Target Account: `950766978386`
+        - Role Name: `WAFAdvisorCrossAccountRole`
+        - Full ARN: `arn:aws:iam::950766978386:role/WAFAdvisorCrossAccountRole`
+        
+        **What you need:**
+        1. IAM user credentials from your **base account** (the account that will assume the role)
+        2. These base credentials must have `sts:AssumeRole` permission
+        3. The role `WAFAdvisorCrossAccountRole` in account 950766978386 must trust your base account
+        """)
         
         st.markdown("---")
         
@@ -851,16 +853,85 @@ def render_multi_account_connector():
                         org_client = session.client('organizations')
                         
                         accounts = org_client.list_accounts()['Accounts']
+                        # Store in session state for selection
+                        st.session_state.discovered_accounts = accounts
+                        st.session_state.org_credentials = {
+                            'access_key': org_access_key,
+                            'secret_key': org_secret_key
+                        }
                         st.success(f"✅ Found {len(accounts)} accounts")
-                        
-                        for account in accounts[:10]:
-                            st.info(f"📌 {account['Name']} - {account['Id']} ({account['Status']})")
-                        
-                        st.info("💡 Add individual account credentials above to enable scanning")
+                        st.rerun()
                     except Exception as e:
                         st.error(f"❌ Error: {str(e)}")
             else:
                 st.warning("Enter management account credentials")
+        
+        # Show discovered accounts with checkboxes
+        if 'discovered_accounts' in st.session_state and st.session_state.discovered_accounts:
+            st.markdown("---")
+            st.markdown("**Select Accounts to Import:**")
+            
+            # Initialize selected accounts if not exists
+            if 'selected_org_accounts' not in st.session_state:
+                st.session_state.selected_org_accounts = []
+            
+            # Show accounts with checkboxes
+            for idx, account in enumerate(st.session_state.discovered_accounts):
+                if account['Status'] == 'ACTIVE':
+                    col1, col2 = st.columns([3, 1])
+                    
+                    with col1:
+                        is_selected = st.checkbox(
+                            f"{account['Name']} - {account['Id']}",
+                            key=f"org_account_{account['Id']}",
+                            value=account['Id'] in st.session_state.selected_org_accounts
+                        )
+                        
+                        if is_selected and account['Id'] not in st.session_state.selected_org_accounts:
+                            st.session_state.selected_org_accounts.append(account['Id'])
+                        elif not is_selected and account['Id'] in st.session_state.selected_org_accounts:
+                            st.session_state.selected_org_accounts.remove(account['Id'])
+                    
+                    with col2:
+                        st.caption(f"Status: {account['Status']}")
+            
+            st.markdown("---")
+            
+            # Import button
+            if st.session_state.selected_org_accounts:
+                st.info(f"📋 {len(st.session_state.selected_org_accounts)} account(s) selected")
+                
+                if st.button("✅ Import Selected Accounts", type="primary", use_container_width=True):
+                    # Import selected accounts
+                    imported_count = 0
+                    for account in st.session_state.discovered_accounts:
+                        if account['Id'] in st.session_state.selected_org_accounts:
+                            # Add to connected accounts
+                            account_info = {
+                                'name': account['Name'],
+                                'account_id': account['Id'],
+                                'email': account.get('Email', 'N/A'),
+                                'status': account['Status'],
+                                'credentials': st.session_state.org_credentials,
+                                'connection_type': 'organizations'
+                            }
+                            
+                            # Check if not already added
+                            if not any(a['account_id'] == account['Id'] for a in st.session_state.connected_accounts):
+                                st.session_state.connected_accounts.append(account_info)
+                                imported_count += 1
+                    
+                    if imported_count > 0:
+                        st.success(f"✅ Successfully imported {imported_count} account(s)!")
+                        st.info("Go to WAF Scanner tab to start scanning these accounts")
+                        # Clear selections
+                        st.session_state.selected_org_accounts = []
+                        st.session_state.discovered_accounts = []
+                        st.rerun()
+                    else:
+                        st.warning("Selected accounts are already imported")
+            else:
+                st.info("👆 Select accounts above to import")
 
 # ============================================================================
 # WAF SCANNER TAB
