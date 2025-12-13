@@ -627,7 +627,7 @@ def render_multi_account_connector():
                 with col2:
                     st.text(f"ID: {account.get('account_id', 'N/A')}")
                 with col3:
-                    st.text(f"Region: {account['region']}")
+                    st.text(f"Region: {account.get('region', 'us-east-1')}")
                 with col4:
                     if st.button("🗑️", key=f"del_{idx}"):
                         st.session_state.connected_accounts.pop(idx)
@@ -912,6 +912,7 @@ def render_multi_account_connector():
                                 'account_id': account['Id'],
                                 'email': account.get('Email', 'N/A'),
                                 'status': account['Status'],
+                                'region': 'us-east-1',  # Default region for org accounts
                                 'credentials': st.session_state.org_credentials,
                                 'connection_type': 'organizations'
                             }
