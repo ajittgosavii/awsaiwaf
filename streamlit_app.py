@@ -1046,6 +1046,28 @@ def render_multi_account_scanner():
     
     st.markdown("---")
     
+    # ADD SCAN MODE TOGGLE
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.markdown("#### Scan Mode")
+    
+    with col2:
+        scan_mode = st.radio(
+            "Mode",
+            ["Demo Mode", "Real Scan"],
+            horizontal=True,
+            help="Demo Mode: Instant results with sample data | Real Scan: Actual AWS resource scanning (slower)",
+            key="real_scan_mode"
+        )
+    
+    if scan_mode == "Demo Mode":
+        st.info("📋 **Demo Mode**: Instant results with sample data (for testing UI)")
+    else:
+        st.warning("🔍 **Real Scan Mode**: Will connect to AWS and scan actual resources (may take 1-5 minutes per account)")
+    
+    st.markdown("---")
+    
     st.markdown("#### Select Accounts to Scan")
     
     selected_accounts = []
@@ -1081,7 +1103,8 @@ def render_multi_account_scanner():
     
     with col1:
         if st.button("🚀 Start Multi-Account Scan", type="primary", use_container_width=True):
-            run_multi_account_waf_scan(selected_accounts, scan_depth, waf_pillars)
+            # Pass scan mode to the function
+            run_multi_account_waf_scan(selected_accounts, scan_depth, waf_pillars, scan_mode)
     
     with col2:
         if st.button("📊 View Results", use_container_width=True):
@@ -1136,10 +1159,10 @@ def run_single_account_waf_scan(session, region, depth, pillars, account_id):
     except Exception as e:
         st.error(f"❌ Scan failed: {str(e)}")
 
-def run_multi_account_waf_scan(accounts, depth, pillars):
+def run_multi_account_waf_scan(accounts, depth, pillars, scan_mode="Demo Mode"):
     """Execute multi-account WAF scan"""
     
-    st.info(f"🚀 Starting scan of {len(accounts)} accounts...")
+    st.info(f"🚀 Starting {'REAL' if scan_mode == 'Real Scan' else 'DEMO'} scan of {len(accounts)} accounts...")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -1151,21 +1174,30 @@ def run_multi_account_waf_scan(accounts, depth, pillars):
             status_text.text(f"🔍 Scanning {account['name']}...")
             progress_bar.progress(int((idx + 1) / len(accounts) * 100))
             
-            result = {
-                'account_name': account['name'],
-                'account_id': account.get('account_id', 'N/A'),
-                'status': 'Success',
-                'resource_count': 150,
-                'issue_count': 20,
-                'compliance_score': 75
-            }
+            if scan_mode == "Real Scan":
+                # REAL AWS SCANNING
+                result = scan_real_aws_account(account, depth, pillars, status_text)
+            else:
+                # DEMO MODE (existing behavior)
+                result = {
+                    'account_name': account['name'],
+                    'account_id': account.get('account_id', 'N/A'),
+                    'status': 'Success',
+                    'resource_count': 150,
+                    'issue_count': 20,
+                    'compliance_score': 75,
+                    'mode': 'Demo'
+                }
+            
             results.append(result)
             
         except Exception as e:
             results.append({
                 'account_name': account['name'],
+                'account_id': account.get('account_id', 'N/A'),
                 'status': 'Failed',
-                'error': str(e)
+                'error': str(e),
+                'mode': scan_mode
             })
     
     st.session_state.multi_scan_results = results
@@ -1176,6 +1208,601 @@ def run_multi_account_waf_scan(accounts, depth, pillars):
     st.success(f"✅ Scanned {len(accounts)} accounts!")
     
     display_multi_account_results(results)
+
+def scan_real_aws_account(account, depth, pillars, status_text):
+    """Scan a real AWS account and return actual resource counts"""
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+    
+    result = {
+        'account_name': account['name'],
+        'account_id': account.get('account_id', 'N/A'),
+        'status': 'Success',
+        'mode': 'Real',
+        'resources': {},
+        'issues': []
+    }
+    
+    try:
+        # Create AWS session based on connection type
+        if account.get('connection_type') == 'organizations':
+            # Organizations import - use management credentials
+            session = boto3.Session(
+                aws_access_key_id=account['credentials']['access_key'],
+                aws_secret_access_key=account['credentials']['secret_key'],
+                region_name=account.get('region', 'us-east-1')
+            )
+        elif account.get('auth_method') == 'assume_role':
+            # AssumeRole - need to assume the role first
+            if 'multi_hub_access_key' in st.session_state:
+                base_session = boto3.Session(
+                    aws_access_key_id=st.session_state.multi_hub_access_key,
+                    aws_secret_access_key=st.session_state.multi_hub_secret_key
+                )
+                from aws_connector import assume_role
+                assumed_creds = assume_role(
+                    base_session,
+                    account['role_arn'],
+                    account.get('external_id'),
+                    session_name="WAFScan"
+                )
+                if not assumed_creds:
+                    raise Exception("Failed to assume role")
+                
+                session = boto3.Session(
+                    aws_access_key_id=assumed_creds.access_key_id,
+                    aws_secret_access_key=assumed_creds.secret_access_key,
+                    aws_session_token=assumed_creds.session_token,
+                    region_name=account.get('region', 'us-east-1')
+                )
+            else:
+                raise Exception("Hub credentials not configured for AssumeRole")
+        else:
+            # Manual credentials
+            session = boto3.Session(
+                aws_access_key_id=account.get('access_key'),
+                aws_secret_access_key=account.get('secret_key'),
+                region_name=account.get('region', 'us-east-1')
+            )
+        
+        # Get account ID if not already known
+        if result['account_id'] == 'N/A':
+            sts = session.client('sts')
+            identity = sts.get_caller_identity()
+            result['account_id'] = identity['Account']
+        
+        total_resources = 0
+        total_issues = 0
+        
+        # Scan EC2 Instances
+        if status_text:
+            status_text.text(f"🔍 Scanning EC2 in {account['name']}...")
+        try:
+            ec2 = session.client('ec2')
+            instances = ec2.describe_instances()
+            ec2_count = sum(len(r['Instances']) for r in instances['Reservations'])
+            result['resources']['EC2'] = ec2_count
+            total_resources += ec2_count
+            
+            # Check for security issues
+            for reservation in instances['Reservations']:
+                for instance in reservation['Instances']:
+                    # Check if instance has public IP without proper security
+                    if instance.get('PublicIpAddress') and instance['State']['Name'] == 'running':
+                        total_issues += 1
+        except Exception as e:
+            result['resources']['EC2'] = f"Error: {str(e)[:50]}"
+        
+        # Scan RDS Databases
+        if status_text:
+            status_text.text(f"🔍 Scanning RDS in {account['name']}...")
+        try:
+            rds = session.client('rds')
+            databases = rds.describe_db_instances()
+            rds_count = len(databases['DBInstances'])
+            result['resources']['RDS'] = rds_count
+            total_resources += rds_count
+            
+            # Check for issues
+            for db in databases['DBInstances']:
+                # Check if Multi-AZ is disabled
+                if not db.get('MultiAZ', False):
+                    total_issues += 1
+                # Check if encryption is disabled
+                if not db.get('StorageEncrypted', False):
+                    total_issues += 1
+        except Exception as e:
+            result['resources']['RDS'] = f"Error: {str(e)[:50]}"
+        
+        # Scan S3 Buckets
+        if status_text:
+            status_text.text(f"🔍 Scanning S3 in {account['name']}...")
+        try:
+            s3 = session.client('s3')
+            buckets = s3.list_buckets()
+            s3_count = len(buckets['Buckets'])
+            result['resources']['S3'] = s3_count
+            total_resources += s3_count
+            
+            # Check bucket encryption and public access
+            for bucket in buckets['Buckets'][:10]:  # Limit to 10 to avoid timeout
+                try:
+                    # Check encryption
+                    try:
+                        s3.get_bucket_encryption(Bucket=bucket['Name'])
+                    except:
+                        total_issues += 1  # No encryption
+                    
+                    # Check public access
+                    try:
+                        acl = s3.get_bucket_acl(Bucket=bucket['Name'])
+                        for grant in acl['Grants']:
+                            if grant.get('Grantee', {}).get('URI') == 'http://acs.amazonaws.com/groups/global/AllUsers':
+                                total_issues += 1  # Public bucket
+                    except:
+                        pass
+                except:
+                    pass
+        except Exception as e:
+            result['resources']['S3'] = f"Error: {str(e)[:50]}"
+        
+        # Scan Lambda Functions
+        if status_text:
+            status_text.text(f"🔍 Scanning Lambda in {account['name']}...")
+        try:
+            lambda_client = session.client('lambda')
+            functions = lambda_client.list_functions()
+            lambda_count = len(functions['Functions'])
+            result['resources']['Lambda'] = lambda_count
+            total_resources += lambda_count
+        except Exception as e:
+            result['resources']['Lambda'] = f"Error: {str(e)[:50]}"
+        
+        # Scan VPCs
+        if depth in ["Standard Scan", "Deep Scan"]:
+            if status_text:
+                status_text.text(f"🔍 Scanning VPCs in {account['name']}...")
+            try:
+                ec2 = session.client('ec2')
+                vpcs = ec2.describe_vpcs()
+                vpc_count = len(vpcs['Vpcs'])
+                result['resources']['VPC'] = vpc_count
+                total_resources += vpc_count
+            except Exception as e:
+                result['resources']['VPC'] = f"Error: {str(e)[:50]}"
+        
+        # Scan Security Groups
+        if depth == "Deep Scan":
+            if status_text:
+                status_text.text(f"🔍 Scanning Security Groups in {account['name']}...")
+            try:
+                ec2 = session.client('ec2')
+                sgs = ec2.describe_security_groups()
+                sg_count = len(sgs['SecurityGroups'])
+                result['resources']['SecurityGroups'] = sg_count
+                total_resources += sg_count
+                
+                # Check for overly permissive rules
+                for sg in sgs['SecurityGroups']:
+                    for rule in sg.get('IpPermissions', []):
+                        for ip_range in rule.get('IpRanges', []):
+                            if ip_range.get('CidrIp') == '0.0.0.0/0':
+                                total_issues += 1  # Open to internet
+            except Exception as e:
+                result['resources']['SecurityGroups'] = f"Error: {str(e)[:50]}"
+        
+        # Scan IAM Users
+        if depth == "Deep Scan":
+            if status_text:
+                status_text.text(f"🔍 Scanning IAM in {account['name']}...")
+            try:
+                iam = session.client('iam')
+                users = iam.list_users()
+                iam_count = len(users['Users'])
+                result['resources']['IAM_Users'] = iam_count
+                total_resources += iam_count
+                
+                # Check for users without MFA
+                for user in users['Users'][:20]:  # Limit to avoid timeout
+                    try:
+                        mfa_devices = iam.list_mfa_devices(UserName=user['UserName'])
+                        if len(mfa_devices['MFADevices']) == 0:
+                            total_issues += 1  # No MFA
+                    except:
+                        pass
+            except Exception as e:
+                result['resources']['IAM_Users'] = f"Error: {str(e)[:50]}"
+        
+        # =====================================================================
+        # EXPANDED SERVICES FOR 90%+ WAF COVERAGE
+        # =====================================================================
+        
+        # Scan EBS Volumes (Cost Optimization, Reliability)
+        if status_text:
+            status_text.text(f"🔍 Scanning EBS volumes in {account['name']}...")
+        try:
+            ec2 = session.client('ec2')
+            volumes = ec2.describe_volumes()
+            ebs_count = len(volumes['Volumes'])
+            result['resources']['EBS_Volumes'] = ebs_count
+            total_resources += ebs_count
+            
+            # Check for unattached volumes (cost waste)
+            for volume in volumes['Volumes']:
+                if volume['State'] == 'available':  # Not attached
+                    total_issues += 1
+                # Check encryption
+                if not volume.get('Encrypted', False):
+                    total_issues += 1
+        except Exception as e:
+            result['resources']['EBS_Volumes'] = f"Error: {str(e)[:50]}"
+        
+        # Scan Load Balancers (Reliability, Performance, Security)
+        if status_text:
+            status_text.text(f"🔍 Scanning Load Balancers in {account['name']}...")
+        try:
+            # ELBv2 (ALB/NLB)
+            elbv2 = session.client('elbv2')
+            albs = elbv2.describe_load_balancers()
+            alb_count = len(albs['LoadBalancers'])
+            result['resources']['ALB_NLB'] = alb_count
+            total_resources += alb_count
+            
+            # Check for internet-facing LBs without deletion protection
+            for lb in albs['LoadBalancers']:
+                attrs = elbv2.describe_load_balancer_attributes(
+                    LoadBalancerArn=lb['LoadBalancerArn']
+                )
+                for attr in attrs['Attributes']:
+                    if attr['Key'] == 'deletion_protection.enabled' and attr['Value'] == 'false':
+                        if lb.get('Scheme') == 'internet-facing':
+                            total_issues += 1
+        except Exception as e:
+            result['resources']['ALB_NLB'] = f"Error: {str(e)[:50]}"
+        
+        # Classic Load Balancers
+        try:
+            elb = session.client('elb')
+            classic_lbs = elb.describe_load_balancers()
+            clb_count = len(classic_lbs['LoadBalancerDescriptions'])
+            result['resources']['Classic_LB'] = clb_count
+            total_resources += clb_count
+            
+            # Classic LBs are deprecated - flag as issue
+            if clb_count > 0:
+                total_issues += clb_count  # Should migrate to ALB/NLB
+        except Exception as e:
+            result['resources']['Classic_LB'] = f"Error: {str(e)[:50]}"
+        
+        # Scan Auto Scaling Groups (Reliability, Performance, Cost)
+        if status_text:
+            status_text.text(f"🔍 Scanning Auto Scaling in {account['name']}...")
+        try:
+            autoscaling = session.client('autoscaling')
+            asgs = autoscaling.describe_auto_scaling_groups()
+            asg_count = len(asgs['AutoScalingGroups'])
+            result['resources']['AutoScaling_Groups'] = asg_count
+            total_resources += asg_count
+            
+            # Check for ASGs without health checks
+            for asg in asgs['AutoScalingGroups']:
+                if asg.get('HealthCheckType') == 'EC2':  # Should be ELB
+                    total_issues += 1
+        except Exception as e:
+            result['resources']['AutoScaling_Groups'] = f"Error: {str(e)[:50]}"
+        
+        # Scan DynamoDB Tables (Performance, Cost, Reliability)
+        if status_text:
+            status_text.text(f"🔍 Scanning DynamoDB in {account['name']}...")
+        try:
+            dynamodb = session.client('dynamodb')
+            tables = dynamodb.list_tables()
+            ddb_count = len(tables['TableNames'])
+            result['resources']['DynamoDB'] = ddb_count
+            total_resources += ddb_count
+            
+            # Check for tables without PITR
+            for table_name in tables['TableNames'][:10]:
+                try:
+                    desc = dynamodb.describe_continuous_backups(TableName=table_name)
+                    if desc['ContinuousBackupsDescription']['PointInTimeRecoveryDescription']['PointInTimeRecoveryStatus'] != 'ENABLED':
+                        total_issues += 1
+                except:
+                    pass
+        except Exception as e:
+            result['resources']['DynamoDB'] = f"Error: {str(e)[:50]}"
+        
+        # Scan ElastiCache Clusters (Performance, Cost)
+        if status_text:
+            status_text.text(f"🔍 Scanning ElastiCache in {account['name']}...")
+        try:
+            elasticache = session.client('elasticache')
+            redis = elasticache.describe_cache_clusters()
+            cache_count = len(redis['CacheClusters'])
+            result['resources']['ElastiCache'] = cache_count
+            total_resources += cache_count
+            
+            # Check for single-node clusters
+            for cluster in redis['CacheClusters']:
+                if cluster.get('NumCacheNodes', 0) == 1:
+                    total_issues += 1  # No redundancy
+        except Exception as e:
+            result['resources']['ElastiCache'] = f"Error: {str(e)[:50]}"
+        
+        # Scan CloudWatch Alarms (Operational Excellence, Reliability)
+        if status_text:
+            status_text.text(f"🔍 Scanning CloudWatch in {account['name']}...")
+        try:
+            cloudwatch = session.client('cloudwatch')
+            alarms = cloudwatch.describe_alarms()
+            alarm_count = len(alarms['MetricAlarms'])
+            result['resources']['CloudWatch_Alarms'] = alarm_count
+            total_resources += alarm_count
+            
+            # Low alarm count relative to resources is an issue
+            if total_resources > 50 and alarm_count < 10:
+                total_issues += 1  # Insufficient monitoring
+        except Exception as e:
+            result['resources']['CloudWatch_Alarms'] = f"Error: {str(e)[:50]}"
+        
+        # Scan SNS Topics (Reliability)
+        if status_text:
+            status_text.text(f"🔍 Scanning SNS in {account['name']}...")
+        try:
+            sns = session.client('sns')
+            topics = sns.list_topics()
+            sns_count = len(topics['Topics'])
+            result['resources']['SNS_Topics'] = sns_count
+            total_resources += sns_count
+        except Exception as e:
+            result['resources']['SNS_Topics'] = f"Error: {str(e)[:50]}"
+        
+        # Scan SQS Queues (Reliability)
+        if status_text:
+            status_text.text(f"🔍 Scanning SQS in {account['name']}...")
+        try:
+            sqs = session.client('sqs')
+            queues = sqs.list_queues()
+            sqs_count = len(queues.get('QueueUrls', []))
+            result['resources']['SQS_Queues'] = sqs_count
+            total_resources += sqs_count
+        except Exception as e:
+            result['resources']['SQS_Queues'] = f"Error: {str(e)[:50]}"
+        
+        # Scan NAT Gateways (Cost, Reliability)
+        if depth in ["Standard Scan", "Deep Scan"]:
+            if status_text:
+                status_text.text(f"🔍 Scanning NAT Gateways in {account['name']}...")
+            try:
+                ec2 = session.client('ec2')
+                nat_gws = ec2.describe_nat_gateways()
+                nat_count = len([n for n in nat_gws['NatGateways'] if n['State'] == 'available'])
+                result['resources']['NAT_Gateways'] = nat_count
+                total_resources += nat_count
+                
+                # Multiple NAT Gateways in same AZ is cost waste
+                az_count = {}
+                for nat in nat_gws['NatGateways']:
+                    if nat['State'] == 'available':
+                        az = nat.get('SubnetId', 'unknown')
+                        az_count[az] = az_count.get(az, 0) + 1
+                for az, count in az_count.items():
+                    if count > 1:
+                        total_issues += (count - 1)  # Extra NAT GWs
+            except Exception as e:
+                result['resources']['NAT_Gateways'] = f"Error: {str(e)[:50]}"
+        
+        # Scan Elastic IPs (Cost)
+        if status_text:
+            status_text.text(f"🔍 Scanning Elastic IPs in {account['name']}...")
+        try:
+            ec2 = session.client('ec2')
+            eips = ec2.describe_addresses()
+            eip_count = len(eips['Addresses'])
+            result['resources']['Elastic_IPs'] = eip_count
+            total_resources += eip_count
+            
+            # Unassociated EIPs cost money
+            for eip in eips['Addresses']:
+                if 'AssociationId' not in eip:
+                    total_issues += 1  # Unattached EIP
+        except Exception as e:
+            result['resources']['Elastic_IPs'] = f"Error: {str(e)[:50]}"
+        
+        # Scan EBS Snapshots (Cost, Reliability)
+        if depth in ["Standard Scan", "Deep Scan"]:
+            if status_text:
+                status_text.text(f"🔍 Scanning EBS Snapshots in {account['name']}...")
+            try:
+                ec2 = session.client('ec2')
+                snapshots = ec2.describe_snapshots(OwnerIds=['self'])
+                snap_count = len(snapshots['Snapshots'])
+                result['resources']['EBS_Snapshots'] = snap_count
+                total_resources += snap_count
+            except Exception as e:
+                result['resources']['EBS_Snapshots'] = f"Error: {str(e)[:50]}"
+        
+        # Scan CloudTrail (Security, Operational Excellence)
+        if depth == "Deep Scan":
+            if status_text:
+                status_text.text(f"🔍 Scanning CloudTrail in {account['name']}...")
+            try:
+                cloudtrail = session.client('cloudtrail')
+                trails = cloudtrail.describe_trails()
+                trail_count = len(trails['trailList'])
+                result['resources']['CloudTrail'] = trail_count
+                total_resources += trail_count
+                
+                # No CloudTrail is a security issue
+                if trail_count == 0:
+                    total_issues += 1
+                
+                # Check if trails are logging
+                for trail in trails['trailList']:
+                    status = cloudtrail.get_trail_status(Name=trail['TrailARN'])
+                    if not status.get('IsLogging', False):
+                        total_issues += 1
+            except Exception as e:
+                result['resources']['CloudTrail'] = f"Error: {str(e)[:50]}"
+        
+        # Scan KMS Keys (Security)
+        if depth == "Deep Scan":
+            if status_text:
+                status_text.text(f"🔍 Scanning KMS in {account['name']}...")
+            try:
+                kms = session.client('kms')
+                keys = kms.list_keys()
+                kms_count = len(keys['Keys'])
+                result['resources']['KMS_Keys'] = kms_count
+                total_resources += kms_count
+            except Exception as e:
+                result['resources']['KMS_Keys'] = f"Error: {str(e)[:50]}"
+        
+        # Scan Secrets Manager (Security)
+        if depth == "Deep Scan":
+            if status_text:
+                status_text.text(f"🔍 Scanning Secrets Manager in {account['name']}...")
+            try:
+                secretsmanager = session.client('secretsmanager')
+                secrets = secretsmanager.list_secrets()
+                secret_count = len(secrets['SecretList'])
+                result['resources']['Secrets'] = secret_count
+                total_resources += secret_count
+                
+                # Check for secrets without rotation
+                for secret in secrets['SecretList']:
+                    if not secret.get('RotationEnabled', False):
+                        total_issues += 1
+            except Exception as e:
+                result['resources']['Secrets'] = f"Error: {str(e)[:50]}"
+        
+        # Scan IAM Roles (Security, Operational Excellence)
+        if depth in ["Standard Scan", "Deep Scan"]:
+            if status_text:
+                status_text.text(f"🔍 Scanning IAM Roles in {account['name']}...")
+            try:
+                iam = session.client('iam')
+                roles = iam.list_roles()
+                role_count = len(roles['Roles'])
+                result['resources']['IAM_Roles'] = role_count
+                total_resources += role_count
+            except Exception as e:
+                result['resources']['IAM_Roles'] = f"Error: {str(e)[:50]}"
+        
+        # Scan ECS Clusters (Operational Excellence, Security)
+        if depth in ["Standard Scan", "Deep Scan"]:
+            if status_text:
+                status_text.text(f"🔍 Scanning ECS in {account['name']}...")
+            try:
+                ecs = session.client('ecs')
+                clusters = ecs.list_clusters()
+                ecs_count = len(clusters['clusterArns'])
+                result['resources']['ECS_Clusters'] = ecs_count
+                total_resources += ecs_count
+                
+                # Count running tasks
+                for cluster_arn in clusters['clusterArns'][:5]:
+                    tasks = ecs.list_tasks(cluster=cluster_arn, desiredStatus='RUNNING')
+                    task_count = len(tasks['taskArns'])
+                    result['resources'][f'ECS_Tasks'] = result['resources'].get('ECS_Tasks', 0) + task_count
+            except Exception as e:
+                result['resources']['ECS_Clusters'] = f"Error: {str(e)[:50]}"
+        
+        # Scan EKS Clusters (Operational Excellence, Security)
+        if depth == "Deep Scan":
+            if status_text:
+                status_text.text(f"🔍 Scanning EKS in {account['name']}...")
+            try:
+                eks = session.client('eks')
+                clusters = eks.list_clusters()
+                eks_count = len(clusters['clusters'])
+                result['resources']['EKS_Clusters'] = eks_count
+                total_resources += eks_count
+                
+                # Check for public endpoint access
+                for cluster_name in clusters['clusters']:
+                    cluster = eks.describe_cluster(name=cluster_name)
+                    if cluster['cluster']['resourcesVpcConfig'].get('endpointPublicAccess', False):
+                        total_issues += 1
+            except Exception as e:
+                result['resources']['EKS_Clusters'] = f"Error: {str(e)[:50]}"
+        
+        # Scan CloudFront Distributions (Performance, Cost)
+        if depth in ["Standard Scan", "Deep Scan"]:
+            if status_text:
+                status_text.text(f"🔍 Scanning CloudFront in {account['name']}...")
+            try:
+                cloudfront = session.client('cloudfront')
+                distributions = cloudfront.list_distributions()
+                cf_count = len(distributions.get('DistributionList', {}).get('Items', []))
+                result['resources']['CloudFront'] = cf_count
+                total_resources += cf_count
+            except Exception as e:
+                result['resources']['CloudFront'] = f"Error: {str(e)[:50]}"
+        
+        # Scan Route 53 Hosted Zones (Reliability)
+        if depth in ["Standard Scan", "Deep Scan"]:
+            if status_text:
+                status_text.text(f"🔍 Scanning Route 53 in {account['name']}...")
+            try:
+                route53 = session.client('route53')
+                zones = route53.list_hosted_zones()
+                r53_count = len(zones['HostedZones'])
+                result['resources']['Route53_Zones'] = r53_count
+                total_resources += r53_count
+            except Exception as e:
+                result['resources']['Route53_Zones'] = f"Error: {str(e)[:50]}"
+        
+        # Scan Backup Vaults (Reliability)
+        if depth == "Deep Scan":
+            if status_text:
+                status_text.text(f"🔍 Scanning AWS Backup in {account['name']}...")
+            try:
+                backup = session.client('backup')
+                vaults = backup.list_backup_vaults()
+                backup_count = len(vaults['BackupVaultList'])
+                result['resources']['Backup_Vaults'] = backup_count
+                total_resources += backup_count
+                
+                # No backup vaults is a reliability issue
+                if backup_count == 0 and total_resources > 20:
+                    total_issues += 1
+            except Exception as e:
+                result['resources']['Backup_Vaults'] = f"Error: {str(e)[:50]}"
+        
+
+        # Calculate compliance score
+        if total_resources > 0:
+            # Score based on issues vs resources
+            issue_ratio = total_issues / max(total_resources, 1)
+            compliance_score = max(0, min(100, int(100 - (issue_ratio * 100))))
+        else:
+            compliance_score = 100
+        
+        result['resource_count'] = total_resources
+        result['issue_count'] = total_issues
+        result['compliance_score'] = compliance_score
+        
+    except NoCredentialsError:
+        result['status'] = 'Failed'
+        result['error'] = 'No valid AWS credentials found'
+        result['resource_count'] = 0
+        result['issue_count'] = 0
+        result['compliance_score'] = 0
+    except ClientError as e:
+        result['status'] = 'Failed'
+        result['error'] = f"AWS Error: {e.response['Error']['Code']}"
+        result['resource_count'] = 0
+        result['issue_count'] = 0
+        result['compliance_score'] = 0
+    except Exception as e:
+        result['status'] = 'Failed'
+        result['error'] = str(e)[:100]
+        result['resource_count'] = 0
+        result['issue_count'] = 0
+        result['compliance_score'] = 0
+    
+    return result
 
 def display_scan_results(results):
     """Display single account scan results"""
@@ -1216,18 +1843,77 @@ def display_multi_account_results(results):
     
     st.markdown("### 📊 Multi-Account Scan Results")
     
+    # Show scan mode indicator
+    if results and results[0].get('mode'):
+        mode = results[0]['mode']
+        if mode == 'Demo':
+            st.info("📋 **Demo Mode Results** - Sample data for UI testing")
+        else:
+            st.success("🔍 **Real Scan Results** - Actual AWS resource data")
+    
     for result in results:
-        with st.expander(f"📌 {result['account_name']} - {result.get('account_id', 'N/A')}"):
-            if result['status'] == 'Success':
+        if result.get('status') == 'Failed':
+            with st.expander(f"❌ {result['account_name']} - {result.get('account_id', 'N/A')} - FAILED", expanded=True):
+                st.error(f"**Error:** {result.get('error', 'Unknown error')}")
+        else:
+            with st.expander(f"📌 {result['account_name']} - {result.get('account_id', 'N/A')}"):
                 col1, col2, col3 = st.columns(3)
+                
                 with col1:
-                    st.metric("Resources", result['resource_count'])
+                    st.metric("Resources", result.get('resource_count', 0))
                 with col2:
-                    st.metric("Issues", result['issue_count'])
+                    st.metric("Issues", result.get('issue_count', 0))
                 with col3:
-                    st.metric("Score", f"{result['compliance_score']}%")
-            else:
-                st.error(f"❌ Scan failed: {result.get('error', 'Unknown error')}")
+                    score = result.get('compliance_score', 0)
+                    st.metric("Score", f"{score}%")
+                
+                # Show detailed resource breakdown for Real scans
+                if result.get('mode') == 'Real' and result.get('resources'):
+                    st.markdown("---")
+                    st.markdown("**Resource Breakdown:**")
+                    
+                    # Display resources in columns
+                    resources = result['resources']
+                    if resources:
+                        cols = st.columns(3)
+                        items = list(resources.items())
+                        for idx, (service, count) in enumerate(items):
+                            with cols[idx % 3]:
+                                if isinstance(count, int):
+                                    st.metric(service, count)
+                                else:
+                                    st.caption(f"{service}: {count}")
+                    
+                    # Show scan depth and pillars used
+                    st.markdown("---")
+                    st.caption(f"Scan completed at: {result.get('scan_time', 'N/A')}")
+                
+                # Show top issues
+                st.markdown("---")
+                st.markdown("**Common Issues Found:**")
+                
+                if result.get('mode') == 'Real':
+                    issue_count = result.get('issue_count', 0)
+                    if issue_count > 0:
+                        st.warning(f"🔸 Found {issue_count} potential security/reliability issues")
+                        st.markdown("""
+                        Issues may include:
+                        - EC2 instances with public IPs
+                        - RDS databases without Multi-AZ
+                        - S3 buckets without encryption
+                        - Security groups open to 0.0.0.0/0
+                        - IAM users without MFA
+                        """)
+                    else:
+                        st.success("✅ No major issues detected!")
+                else:
+                    # Demo mode - show sample issues
+                    st.warning("**Security:** 8 issues")
+                    st.markdown("- Unencrypted S3 buckets\n- Public EC2 instances\n- Missing MFA")
+                    st.warning("**Reliability:** 7 issues")
+                    st.markdown("- Single-AZ RDS\n- No backup configured")
+                    st.info("**Cost Optimization:** 5 issues")
+                    st.markdown("- Underutilized instances\n- Unattached EBS volumes")
 
 # ============================================================================
 # MAIN TABS
